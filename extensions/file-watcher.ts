@@ -353,10 +353,20 @@ function runSmokeTests(): void {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Register --marker flag so users can configure it persistently:
+	//   pi --marker "#go!"
+	// Or in ~/.pi/agent/settings.json / .pi/settings.json:
+	//   { "flags": { "--marker": "#go!" } }
+	pi.registerFlag("marker", {
+		description: 'Trigger marker for file-watcher (default: "#pi!")',
+		type: "string",
+		default: "#pi!",
+	});
+
 	const state: WatcherState = {
 		watchedPaths: new Map(),
 		pendingRestart: new Set(),
-		activeMarker: "#pi!",
+		activeMarker: (pi.getFlag("--marker") as string | undefined) ?? "#pi!",
 		debounceTimers: new Map(),
 	};
 

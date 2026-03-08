@@ -32,6 +32,30 @@ Then in any source file, add `#pi!` at the end of a comment line and save:
 
 Pi picks it up instantly and starts working. The marker is automatically removed from the file when the task is complete.
 
+## Configuration
+
+### Persistent marker (recommended)
+
+Set your preferred marker once via CLI flag — pi remembers it across sessions:
+
+```bash
+pi --marker "#go!"
+```
+
+Or add it to your settings file (`~/.pi/agent/settings.json` for global, `.pi/settings.json` for project):
+
+```json
+{ "flags": { "--marker": "#go!" } }
+```
+
+### Runtime marker change
+
+Change the marker for the current session only:
+
+```
+/watch marker #go!
+```
+
 ## Commands
 
 | Command | Description |
@@ -39,7 +63,7 @@ Pi picks it up instantly and starts working. The marker is automatically removed
 | `/watch start <path>` | Start watching a directory |
 | `/watch stop [path]` | Stop watching one or all directories |
 | `/watch status` | Show watched paths and current marker |
-| `/watch marker <marker>` | Change the trigger marker (default: `#pi!`) |
+| `/watch marker <marker>` | Change the trigger marker for this session |
 
 ## How it works
 

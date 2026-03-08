@@ -1,0 +1,18 @@
+{
+  "name": "pi-file-watcher",
+  "version": "1.0.0",
+  "description": "Watch folders for #pi! comments in source files and send them as prompts to the LLM — aider-style watch mode for pi",
+  "keywords": ["pi-package", "pi", "file-watcher", "watch-mode", "aider"],
+  "author": "",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "files": [
+    "extensions/",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

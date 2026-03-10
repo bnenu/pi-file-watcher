@@ -10,15 +10,21 @@
  *   Then run `/reload` inside pi, or restart pi.
  *
  * Commands:
- *   /watch start <path>      Start watching a directory
+ *   /watch start [path]      Start watching a directory (defaults to .)
  *   /watch stop [path]       Stop watching one or all directories
- *   /watch status            Show watched paths and current marker
+ *   /watch status            Show watched paths, marker, and pending deferred jobs
  *   /watch marker <marker>   Change the trigger marker (default: #pi!)
+ *   /watch cancel [path]     Cancel pending deferred job(s)
  *
  * Trigger syntax — add the marker at the end of any comment line:
- *   // refactor this to use async/await  ← add #pi! here to trigger
- *   # rename this variable               ← add #pi! here to trigger
- *   -- optimise this query               ← add #pi! here to trigger
+ *   // refactor this to use async/await  #pi!        ← fires immediately on save
+ *   // review this whole file            #pi! @5m    ← fires 5 minutes after save
+ *   // optimise this query               #pi! @2h    ← fires 2 hours after save
+ *   // clean up before standup           #pi! @09:30 ← fires at 09:30 local time
+ *
+ * Deferred time spec formats (after @):
+ *   Relative: 30s, 5m, 2h, 1h30m
+ *   Absolute: HH:MM (local time; schedules next-day if already past)
  *
  * How deduplication works (no files, no storage):
  *   When a trigger fires, the watcher closes immediately (the OS drops any
@@ -49,12 +55,25 @@ function isIgnored(filePath: string, ignoredDirs: Set<string>): boolean {
 // Types
 // ---------------------------------------------------------------------------
 
+interface ParsedPrompt {
+	text: string;
+	delayMs: number; // 0 = fire immediately
+}
+
+interface DeferredJob {
+	filePath: string;
+	timer: ReturnType<typeof setTimeout>;
+	prompts: ParsedPrompt[];
+	fireAt: number; // epoch ms, for time-remaining display
+}
+
 interface WatcherState {
 	watchedPaths: Map<string, fs.FSWatcher>;
 	pendingRestart: Set<string>;
 	activeMarker: string;
 	debounceTimers: Map<string, ReturnType<typeof setTimeout>>;
 	ignoredDirs: Set<string>;
+	deferredJobs: Map<string, DeferredJob>; // key: filePath, latest-wins
 }
 
 // ---------------------------------------------------------------------------
@@ -67,10 +86,39 @@ interface WatcherState {
  */
 function buildMarkerRegex(marker: string): RegExp {
 	const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	// Group 1: prompt text. Group 2: optional delay spec after @  (e.g. "5m", "2h", "17:00")
 	return new RegExp(
-		`^\\s*(?:\\/\\/|#|--|;+|\\*|\\/\\*|<!--)?\\s*(.*?)\\s*${escaped}\\s*$`,
+		`^\\s*(?:\\/\\/|#|--|;+|\\*|\\/\\*|<!--)?\\s*(.*?)\\s*${escaped}(?:\\s+@([\\w:]+))?\\s*$`,
 		"i",
 	);
+}
+
+/**
+ * Parse a delay spec (without leading @) into milliseconds.
+ * Supports relative (5m, 2h, 30s, 1h30m) and absolute clock time (17:00).
+ * Returns null if the spec is unrecognised (caller falls back to immediate).
+ */
+function parseDelay(spec: string): number | null {
+	// Relative: optional hours, minutes, seconds — at least one must be present
+	const rel = spec.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+	if (rel && (rel[1] || rel[2] || rel[3])) {
+		const h = parseInt(rel[1] ?? "0");
+		const m = parseInt(rel[2] ?? "0");
+		const s = parseInt(rel[3] ?? "0");
+		return (h * 3600 + m * 60 + s) * 1000;
+	}
+	// Absolute clock time: HH:MM (local time)
+	const abs = spec.match(/^(\d{1,2}):(\d{2})$/);
+	if (abs) {
+		const hh = parseInt(abs[1]);
+		const mm = parseInt(abs[2]);
+		if (hh > 23 || mm > 59) return null;
+		const target = new Date();
+		target.setHours(hh, mm, 0, 0);
+		if (target.getTime() <= Date.now()) target.setDate(target.getDate() + 1);
+		return target.getTime() - Date.now();
+	}
+	return null;
 }
 
 /**
@@ -83,20 +131,22 @@ function isJsDocContinuationLine(line: string): boolean {
 }
 
 /**
- * Scan file content for trigger lines. Returns clean prompt strings
- * (comment prefix and marker stripped).
+ * Scan file content for trigger lines. Returns parsed prompts with optional delay.
+ * A line ending in `#pi! @5m` schedules the prompt for 5 minutes from now.
+ * A line ending in just `#pi!` fires immediately (delayMs: 0).
  */
-function parsePrompts(content: string, marker: string): string[] {
+function parsePrompts(content: string, marker: string): ParsedPrompt[] {
 	const regex = buildMarkerRegex(marker);
-	const results: string[] = [];
+	const results: ParsedPrompt[] = [];
 	for (const line of content.split("\n")) {
 		if (isJsDocContinuationLine(line)) continue;
 		const match = regex.exec(line.trimEnd());
 		if (match) {
-			const prompt = match[1].trim();
-			if (prompt.length > 0) {
-				results.push(prompt);
-			}
+			const text = match[1].trim();
+			if (text.length === 0) continue;
+			const spec = match[2]; // undefined if no @annotation
+			const delayMs = spec != null ? (parseDelay(spec) ?? 0) : 0;
+			results.push({ text, delayMs });
 		}
 	}
 	return results;
@@ -181,6 +231,8 @@ function closeAllWatchers(state: WatcherState): void {
 		clearTimeout(timer);
 	}
 	state.debounceTimers.clear();
+	// NOTE: deferredJobs intentionally NOT cleared here — deferred timers must
+	// survive watcher close/reopen cycles and fire independently of watch state.
 }
 
 function reopenAllWatchers(
@@ -197,6 +249,13 @@ function reopenAllWatchers(
 // ---------------------------------------------------------------------------
 // File handler
 // ---------------------------------------------------------------------------
+
+function cancelDeferredJob(filePath: string, state: WatcherState): void {
+	const job = state.deferredJobs.get(filePath);
+	if (!job) return;
+	clearTimeout(job.timer);
+	state.deferredJobs.delete(filePath);
+}
 
 function handleFileChange(
 	filePath: string,
@@ -225,10 +284,40 @@ function handleFileChange(
 	if (isBinary(buffer)) return;
 
 	const content = buffer.toString("utf-8");
-	const prompts = parsePrompts(content, state.activeMarker);
-	if (prompts.length === 0) return;
+	const parsed = parsePrompts(content, state.activeMarker);
 
-	submitPrompts(prompts, filePath, state, ctx, pi);
+	// Any re-save cancels an existing deferred job for this file (latest-wins)
+	cancelDeferredJob(filePath, state);
+
+	if (parsed.length === 0) return;
+
+	const immediate = parsed.filter((p) => p.delayMs === 0).map((p) => p.text);
+	const deferred = parsed.filter((p) => p.delayMs > 0);
+
+	if (immediate.length > 0) {
+		submitPrompts(immediate, filePath, state, ctx, pi);
+	}
+
+	if (deferred.length > 0) {
+		// All deferred prompts on this file fire together at the longest delay
+		const maxDelayMs = Math.max(...deferred.map((p) => p.delayMs));
+		const fireAt = Date.now() + maxDelayMs;
+
+		const timer = setTimeout(() => {
+			state.deferredJobs.delete(filePath);
+			submitPrompts(deferred.map((p) => p.text), filePath, state, null, pi);
+		}, maxDelayMs);
+
+		state.deferredJobs.set(filePath, { filePath, timer, prompts: deferred, fireAt });
+
+		const basename = path.basename(filePath);
+		const count = deferred.length;
+		const mins = Math.round(maxDelayMs / 60_000);
+		const timeStr = maxDelayMs < 60_000
+			? `${Math.round(maxDelayMs / 1000)}s`
+			: mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h${mins % 60 > 0 ? ` ${mins % 60}m` : ""}`;
+		notify(ctx, `${count} prompt(s) in ${basename} scheduled in ${timeStr}`, "info");
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +390,8 @@ function stopWatching(
 		state.watchedPaths.clear();
 		for (const timer of state.debounceTimers.values()) clearTimeout(timer);
 		state.debounceTimers.clear();
+		for (const job of state.deferredJobs.values()) clearTimeout(job.timer);
+		state.deferredJobs.clear();
 		notify(ctx, "Stopped watching all paths", "info");
 		return;
 	}
@@ -314,11 +405,17 @@ function stopWatching(
 
 	try { watcher.close(); } catch { /* ignore */ }
 	state.watchedPaths.delete(absPath);
-	// Clear debounce timers for files under this path
+	// Clear debounce timers and deferred jobs for files under this path
 	for (const [filePath, timer] of state.debounceTimers) {
 		if (filePath.startsWith(absPath)) {
 			clearTimeout(timer);
 			state.debounceTimers.delete(filePath);
+		}
+	}
+	for (const [filePath, job] of state.deferredJobs) {
+		if (filePath.startsWith(absPath)) {
+			clearTimeout(job.timer);
+			state.deferredJobs.delete(filePath);
 		}
 	}
 	notify(ctx, `Stopped watching ${absPath}`, "info");
@@ -336,21 +433,41 @@ function runSmokeTests(): void {
 		}
 	};
 
-	// JS comment
-	assert("JS //", parsePrompts("// refactor to async #pi!", "#pi!"), ["refactor to async"]);
-	// Python comment
-	assert("Python #", parsePrompts("# rename variable #pi!", "#pi!"), ["rename variable"]);
-	// SQL comment
-	assert("SQL --", parsePrompts("-- optimise query #pi!", "#pi!"), ["optimise query"]);
-	// No match
-	assert("no match", parsePrompts("just a normal line", "#pi!"), []);
-	// Multi-line batch
-	assert("multi", parsePrompts("// fix this #pi!\n// also that #pi!", "#pi!"), ["fix this", "also that"]);
-	// Case-insensitive marker
-	assert("case-insensitive", parsePrompts("// do something #PI!", "#pi!"), ["do something"]);
-	// JSDoc continuation lines must NOT trigger
-	assert("jsdoc skip *", parsePrompts(" *   // refactor this #pi!", "#pi!"), []);
-	assert("jsdoc skip * 2", parsePrompts(" * fix something #pi!", "#pi!"), []);
+	// parsePrompts — immediate (no annotation)
+	assert("JS //",    parsePrompts("// refactor to async #pi!", "#pi!"), [{ text: "refactor to async", delayMs: 0 }]);
+	assert("Python #", parsePrompts("# rename variable #pi!",   "#pi!"), [{ text: "rename variable",   delayMs: 0 }]);
+	assert("SQL --",   parsePrompts("-- optimise query #pi!",   "#pi!"), [{ text: "optimise query",    delayMs: 0 }]);
+	assert("no match", parsePrompts("just a normal line",        "#pi!"), []);
+	assert("multi",    parsePrompts("// fix this #pi!\n// also that #pi!", "#pi!"),
+		[{ text: "fix this", delayMs: 0 }, { text: "also that", delayMs: 0 }]);
+	assert("case-insensitive", parsePrompts("// do something #PI!", "#pi!"), [{ text: "do something", delayMs: 0 }]);
+	assert("jsdoc skip *",   parsePrompts(" *   // refactor this #pi!", "#pi!"), []);
+	assert("jsdoc skip * 2", parsePrompts(" * fix something #pi!",     "#pi!"), []);
+
+	// parsePrompts — deferred annotations
+	assert("deferred 5m",    parsePrompts("// refactor #pi! @5m",   "#pi!"), [{ text: "refactor",    delayMs: 5 * 60_000 }]);
+	assert("deferred 2h",    parsePrompts("// review #pi! @2h",     "#pi!"), [{ text: "review",      delayMs: 2 * 3_600_000 }]);
+	assert("deferred 30s",   parsePrompts("// quick fix #pi! @30s", "#pi!"), [{ text: "quick fix",   delayMs: 30_000 }]);
+	assert("deferred 1h30m", parsePrompts("// refactor #pi! @1h30m","#pi!"), [{ text: "refactor",    delayMs: 5_400_000 }]);
+	assert("deferred bad spec falls back to immediate",
+		parsePrompts("// fix #pi! @badspec", "#pi!"), [{ text: "fix", delayMs: 0 }]);
+
+	// parseDelay
+	assert("parseDelay 5m",    parseDelay("5m"),    5 * 60_000);
+	assert("parseDelay 2h",    parseDelay("2h"),    2 * 3_600_000);
+	assert("parseDelay 30s",   parseDelay("30s"),   30_000);
+	assert("parseDelay 1h30m", parseDelay("1h30m"), 5_400_000);
+	assert("parseDelay 0m",    parseDelay("0m"),    0);
+	assert("parseDelay bad",   parseDelay("badspec"), null);
+	assert("parseDelay empty", parseDelay(""),        null);
+	assert("parseDelay 25:00", parseDelay("25:00"),   null); // invalid hour
+	assert("parseDelay 12:60", parseDelay("12:60"),   null); // invalid minute
+	// Absolute clock: value depends on current time, so just range-check
+	const absDelay = parseDelay("23:59");
+	if (absDelay === null || absDelay <= 0 || absDelay > 24 * 3_600_000) {
+		console.error(`[file-watcher] FAIL: parseDelay 23:59 out of range, got: ${absDelay}`);
+	}
+
 	// isBinary
 	const binBuf = Buffer.from([72, 101, 108, 0, 111]); // 'Hel\0o'
 	assert("isBinary true", isBinary(binBuf), true);
@@ -374,7 +491,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerFlag("watch", {
-		description: "Auto-start watching a directory on launch (e.g. pi --watch ./src)",
+		description: "Auto-start watching on launch. Optionally specify a path (pi --watch ./src); omit to watch the current directory (pi --watch)",
 		type: "string",
 	});
 
@@ -397,14 +514,19 @@ export default function (pi: ExtensionAPI) {
 		activeMarker: (pi.getFlag("--marker") as string | undefined) ?? "#pi!",
 		debounceTimers: new Map(),
 		ignoredDirs,
+		deferredJobs: new Map(),
 	};
 
 	// Run smoke tests on load
 	runSmokeTests();
 
-	// Auto-start watching if --watch flag is set
-	const autoWatchPath = pi.getFlag("--watch") as string | undefined;
-	if (autoWatchPath) {
+	// Auto-start watching if --watch flag is set.
+	// Accepts a path (pi --watch ./src) or no value (pi --watch) to watch cwd.
+	// Reads process.argv directly since pi's flag system requires a value for string flags.
+	const watchArgIndex = process.argv.indexOf("--watch");
+	if (watchArgIndex !== -1) {
+		const next = process.argv[watchArgIndex + 1];
+		const autoWatchPath = next && !next.startsWith("-") ? next : ".";
 		startWatching(autoWatchPath, state, null, pi);
 	}
 
@@ -421,14 +543,16 @@ export default function (pi: ExtensionAPI) {
 			try { watcher.close(); } catch { /* ignore */ }
 		}
 		for (const timer of state.debounceTimers.values()) clearTimeout(timer);
+		for (const job of state.deferredJobs.values()) clearTimeout(job.timer);
 		state.watchedPaths.clear();
 		state.debounceTimers.clear();
+		state.deferredJobs.clear();
 		state.pendingRestart.clear();
 	});
 
 	// /watch command
 	pi.registerCommand("watch", {
-		description: "Control file watching. Usage: /watch start <path> | stop [path] | status | marker <marker>",
+		description: "Control file watching. Usage: /watch start [path] | stop [path] | status | marker <marker> | cancel [path]",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
 			const subcommand = parts[0];
@@ -447,17 +571,51 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "status": {
-					if (state.watchedPaths.size === 0) {
-						ctx.ui.notify(
-							"Not watching any paths. Use /watch start <path> to begin.",
-							"info",
-						);
-					} else {
+					const lines: string[] = [];
+					if (state.watchedPaths.size > 0) {
 						const pathList = [...state.watchedPaths.keys()].join("\n  ");
-						ctx.ui.notify(
-							`Watching ${state.watchedPaths.size} path(s) (marker: ${state.activeMarker}):\n  ${pathList}`,
-							"info",
-						);
+						lines.push(`Watching ${state.watchedPaths.size} path(s) (marker: ${state.activeMarker}):\n  ${pathList}`);
+					}
+					if (state.deferredJobs.size > 0) {
+						const jobLines = [...state.deferredJobs.values()].map((job) => {
+							const remSec = Math.max(0, Math.round((job.fireAt - Date.now()) / 1000));
+							const h = Math.floor(remSec / 3600);
+							const m = Math.floor((remSec % 3600) / 60);
+							const s = remSec % 60;
+							const t = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+							return `  ${path.basename(job.filePath)} — fires in ${t}`;
+						});
+						lines.push(`Pending deferred jobs (${state.deferredJobs.size}):\n${jobLines.join("\n")}`);
+					}
+					if (lines.length === 0) {
+						ctx.ui.notify("Not watching any paths. Use /watch start to begin.", "info");
+					} else {
+						ctx.ui.notify(lines.join("\n\n"), "info");
+					}
+					break;
+				}
+
+				case "cancel": {
+					const cancelPath = parts[1];
+					if (!cancelPath) {
+						if (state.deferredJobs.size === 0) {
+							ctx.ui.notify("No pending deferred jobs.", "info");
+							return;
+						}
+						const count = state.deferredJobs.size;
+						for (const job of state.deferredJobs.values()) clearTimeout(job.timer);
+						state.deferredJobs.clear();
+						ctx.ui.notify(`Cancelled ${count} deferred job(s).`, "info");
+					} else {
+						const absCancel = path.resolve(cancelPath);
+						const job = state.deferredJobs.get(absCancel);
+						if (!job) {
+							ctx.ui.notify(`No pending deferred job for ${absCancel}`, "warning");
+							return;
+						}
+						clearTimeout(job.timer);
+						state.deferredJobs.delete(absCancel);
+						ctx.ui.notify(`Cancelled deferred job for ${path.basename(absCancel)}`, "info");
 					}
 					break;
 				}
@@ -475,7 +633,7 @@ export default function (pi: ExtensionAPI) {
 
 				default: {
 					ctx.ui.notify(
-						"Usage: /watch start <path> | stop [path] | status | marker <marker>",
+						"Usage: /watch start [path] | stop [path] | status | marker <marker> | cancel [path]",
 						"info",
 					);
 					break;

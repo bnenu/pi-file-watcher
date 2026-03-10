@@ -20,18 +20,34 @@ Start watching a directory (defaults to `.` if no path given):
 Then in any source file, add `#pi!` at the end of a comment line and save:
 
 ```ts
-// refactor this function to use async/await  ← add #pi! and save
+// refactor this function to use async/await  #pi!
 ```
 
 ```python
-# rename this variable to something descriptive  ← add #pi! and save
+# rename this variable to something descriptive  #pi!
 ```
 
 ```sql
--- optimise this query  ← add #pi! and save
+-- optimise this query  #pi!
 ```
 
 Pi picks it up instantly and starts working. The marker is automatically removed from the file when the task is complete.
+
+### Deferred execution
+
+Add a time annotation after `#pi!` to schedule the prompt instead of firing immediately:
+
+```ts
+// refactor this to use async/await    #pi! @5m
+// review this file for edge cases     #pi! @2h
+// clean up before standup             #pi! @09:30
+// come back to this tonight           #pi! @18:00
+```
+
+**Relative formats:** `30s`, `5m`, `2h`, `1h30m`
+**Absolute format:** `HH:MM` local time (schedules next day if already past)
+
+If you save again before the timer fires, the old job is cancelled and re-evaluated from the new file content. Use `/watch cancel` to cancel manually.
 
 ## Configuration
 
@@ -90,10 +106,11 @@ Change the marker for the current session only:
 
 | Command | Description |
 |---|---|
-| `/watch start <path>` | Start watching a directory |
+| `/watch start [path]` | Start watching a directory (defaults to `.`) |
 | `/watch stop [path]` | Stop watching one or all directories |
-| `/watch status` | Show watched paths and current marker |
+| `/watch status` | Show watched paths, marker, and pending deferred jobs |
 | `/watch marker <marker>` | Change the trigger marker for this session |
+| `/watch cancel [path]` | Cancel pending deferred job(s) |
 
 ## How it works
 

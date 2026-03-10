@@ -32,6 +32,20 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
+// Ignored paths
+// ---------------------------------------------------------------------------
+
+const IGNORED_DIRS = new Set([
+	"node_modules", ".git", "dist", "build", ".next", ".nuxt",
+	"coverage", "__pycache__", ".cache", ".turbo", ".svelte-kit",
+	"out", ".output", ".vercel", ".netlify",
+]);
+
+function isIgnored(filePath: string, ignoredDirs: Set<string>): boolean {
+	return filePath.split(path.sep).some((part) => ignoredDirs.has(part));
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -40,6 +54,7 @@ interface WatcherState {
 	pendingRestart: Set<string>;
 	activeMarker: string;
 	debounceTimers: Map<string, ReturnType<typeof setTimeout>>;
+	ignoredDirs: Set<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,10 +114,15 @@ function isBinary(buffer: Buffer): boolean {
 // Watcher lifecycle
 // ---------------------------------------------------------------------------
 
+function notify(ctx: ExtensionContext | null, msg: string, level: "info" | "warning" | "error"): void {
+	if (ctx?.hasUI) ctx.ui.notify(msg, level);
+	else console.log(`[file-watcher] ${level.toUpperCase()}: ${msg}`);
+}
+
 function openWatcher(
 	absPath: string,
 	state: WatcherState,
-	ctx: ExtensionContext,
+	ctx: ExtensionContext | null,
 	pi: ExtensionAPI,
 ): void {
 	let watcher: fs.FSWatcher;
@@ -110,6 +130,9 @@ function openWatcher(
 	const eventHandler = (eventType: string, filename: string | null) => {
 		if (!filename) return;
 		const filePath = path.join(absPath, filename);
+
+		// Skip ignored directories
+		if (isIgnored(filePath, state.ignoredDirs)) return;
 
 		// Debounce: clear existing timer and set a new 300 ms one
 		const existing = state.debounceTimers.get(filePath);
@@ -129,16 +152,9 @@ function openWatcher(
 		// Fallback for Linux / OS that doesn't support recursive
 		try {
 			watcher = fs.watch(absPath, { recursive: false }, eventHandler);
-			if (ctx.hasUI) {
-				ctx.ui.notify(
-					"Recursive watch unavailable on this OS; watching top-level only",
-					"warning",
-				);
-			}
+			notify(ctx, "Recursive watch unavailable on this OS; watching top-level only", "warning");
 		} catch (err) {
-			if (ctx.hasUI) {
-				ctx.ui.notify(`Failed to watch ${absPath}: ${String(err)}`, "error");
-			}
+			notify(ctx, `Failed to watch ${absPath}: ${String(err)}`, "error");
 			return;
 		}
 	}
@@ -185,7 +201,7 @@ function reopenAllWatchers(
 function handleFileChange(
 	filePath: string,
 	state: WatcherState,
-	ctx: ExtensionContext,
+	ctx: ExtensionContext | null,
 	pi: ExtensionAPI,
 ): void {
 	let stat: fs.Stats;
@@ -223,7 +239,7 @@ function submitPrompts(
 	prompts: string[],
 	filePath: string,
 	state: WatcherState,
-	ctx: ExtensionContext,
+	ctx: ExtensionContext | null,
 	pi: ExtensionAPI,
 ): void {
 	// Close all watchers immediately — OS drops any saves during the gap
@@ -234,16 +250,13 @@ function submitPrompts(
 	const preview = prompts[0].slice(0, 60) + (prompts[0].length > 60 ? "…" : "");
 	const basename = path.basename(filePath);
 
-	if (ctx.isIdle()) {
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Prompt detected in ${basename}: ${preview}`, "info");
-		}
+	// When ctx is null (auto-started before any agent turn), assume idle
+	if (!ctx || ctx.isIdle()) {
+		notify(ctx, `Prompt detected in ${basename}: ${preview}`, "info");
 		pi.sendUserMessage(message);
 		// Watchers stay closed — agent_end handler will reopen them
 	} else {
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Prompt queued (agent is busy): ${preview}`, "info");
-		}
+		notify(ctx, `Prompt queued (agent is busy): ${preview}`, "info");
 		pi.sendUserMessage(message, { deliverAs: "followUp" });
 		// Watchers stay closed — agent_end handler will reopen after followUp runs
 	}
@@ -256,32 +269,29 @@ function submitPrompts(
 function startWatching(
 	rawPath: string,
 	state: WatcherState,
-	ctx: ExtensionContext,
+	ctx: ExtensionContext | null,
 	pi: ExtensionAPI,
 ): void {
 	const absPath = path.resolve(rawPath);
 
 	if (!fs.existsSync(absPath)) {
-		if (ctx.hasUI) ctx.ui.notify(`Path not found: ${absPath}`, "error");
+		notify(ctx, `Path not found: ${absPath}`, "error");
 		return;
 	}
 
 	if (state.watchedPaths.has(absPath)) {
-		if (ctx.hasUI) ctx.ui.notify(`Already watching ${absPath}`, "warning");
+		notify(ctx, `Already watching ${absPath}`, "warning");
 		return;
 	}
 
 	openWatcher(absPath, state, ctx, pi);
-
-	if (ctx.hasUI) {
-		ctx.ui.notify(`Watching ${absPath} (marker: ${state.activeMarker})`, "info");
-	}
+	notify(ctx, `Watching ${absPath} (marker: ${state.activeMarker})`, "info");
 }
 
 function stopWatching(
 	rawPath: string | undefined,
 	state: WatcherState,
-	ctx: ExtensionContext,
+	ctx: ExtensionContext | null,
 ): void {
 	if (!rawPath) {
 		// Stop all
@@ -291,14 +301,14 @@ function stopWatching(
 		state.watchedPaths.clear();
 		for (const timer of state.debounceTimers.values()) clearTimeout(timer);
 		state.debounceTimers.clear();
-		if (ctx.hasUI) ctx.ui.notify("Stopped watching all paths", "info");
+		notify(ctx, "Stopped watching all paths", "info");
 		return;
 	}
 
 	const absPath = path.resolve(rawPath);
 	const watcher = state.watchedPaths.get(absPath);
 	if (!watcher) {
-		if (ctx.hasUI) ctx.ui.notify(`Not currently watching ${absPath}`, "warning");
+		notify(ctx, `Not currently watching ${absPath}`, "warning");
 		return;
 	}
 
@@ -311,7 +321,7 @@ function stopWatching(
 			state.debounceTimers.delete(filePath);
 		}
 	}
-	if (ctx.hasUI) ctx.ui.notify(`Stopped watching ${absPath}`, "info");
+	notify(ctx, `Stopped watching ${absPath}`, "info");
 }
 
 // ---------------------------------------------------------------------------
@@ -363,15 +373,40 @@ export default function (pi: ExtensionAPI) {
 		default: "#pi!",
 	});
 
+	pi.registerFlag("watch", {
+		description: "Auto-start watching a directory on launch (e.g. pi --watch ./src)",
+		type: "string",
+	});
+
+	pi.registerFlag("ignore", {
+		description: 'Extra directories to ignore, comma-separated (merged with defaults). E.g. pi --ignore "tmp,fixtures"',
+		type: "string",
+	});
+
+	const ignoredDirs = new Set(IGNORED_DIRS);
+	const extraIgnore = pi.getFlag("--ignore") as string | undefined;
+	if (extraIgnore) {
+		for (const dir of extraIgnore.split(",").map((s) => s.trim()).filter(Boolean)) {
+			ignoredDirs.add(dir);
+		}
+	}
+
 	const state: WatcherState = {
 		watchedPaths: new Map(),
 		pendingRestart: new Set(),
 		activeMarker: (pi.getFlag("--marker") as string | undefined) ?? "#pi!",
 		debounceTimers: new Map(),
+		ignoredDirs,
 	};
 
 	// Run smoke tests on load
 	runSmokeTests();
+
+	// Auto-start watching if --watch flag is set
+	const autoWatchPath = pi.getFlag("--watch") as string | undefined;
+	if (autoWatchPath) {
+		startWatching(autoWatchPath, state, null, pi);
+	}
 
 	// Reopen watchers after every LLM turn — covers both normal turns and followUps
 	pi.on("agent_end", async (_event, ctx) => {
@@ -400,11 +435,7 @@ export default function (pi: ExtensionAPI) {
 
 			switch (subcommand) {
 				case "start": {
-					const watchPath = parts[1];
-					if (!watchPath) {
-						ctx.ui.notify("Usage: /watch start <path>", "warning");
-						return;
-					}
+					const watchPath = parts[1] ?? ".";
 					startWatching(watchPath, state, ctx, pi);
 					break;
 				}

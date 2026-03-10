@@ -10,9 +10,10 @@ pi install npm:pi-file-watcher
 
 ## Usage
 
-Start watching a directory:
+Start watching a directory (defaults to `.` if no path given):
 
 ```
+/watch start
 /watch start ./src
 ```
 
@@ -34,7 +35,36 @@ Pi picks it up instantly and starts working. The marker is automatically removed
 
 ## Configuration
 
-### Persistent marker (recommended)
+### Auto-start watching (recommended)
+
+Launch pi and start watching immediately with `--watch`:
+
+```bash
+pi --watch ./src
+pi --watch ./src --marker "#go!"
+```
+
+Or persist it in your settings file (`~/.pi/agent/settings.json` for global, `.pi/settings.json` for project):
+
+```json
+{ "flags": { "--watch": "./src", "--marker": "#go!" } }
+```
+
+### Extra ignored directories
+
+By default the watcher skips `node_modules`, `.git`, `dist`, `build`, and a handful of other common output dirs. Add more with `--ignore` (comma-separated, merged with the defaults):
+
+```bash
+pi --ignore "tmp,fixtures,__snapshots__"
+```
+
+Or in settings:
+
+```json
+{ "flags": { "--ignore": "tmp,fixtures" } }
+```
+
+### Persistent marker
 
 Set your preferred marker once via CLI flag — pi remembers it across sessions:
 
@@ -42,7 +72,7 @@ Set your preferred marker once via CLI flag — pi remembers it across sessions:
 pi --marker "#go!"
 ```
 
-Or add it to your settings file (`~/.pi/agent/settings.json` for global, `.pi/settings.json` for project):
+Or add it to your settings file:
 
 ```json
 { "flags": { "--marker": "#go!" } }

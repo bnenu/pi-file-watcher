@@ -1,6 +1,6 @@
 {
   "name": "pi-file-watcher",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Watch folders for #pi! comments in source files and send them as prompts to the LLM — aider-style watch mode for pi",
   "keywords": ["pi-package", "pi", "file-watcher", "watch-mode", "aider"],
   "author": "Bogdan Nenu",

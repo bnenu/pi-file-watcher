@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 — 2026-04-07
+
+### Changed
+- Raised `peerDependencies` floor for `@mariozechner/pi-coding-agent` from `>=0.62.0` to `>=0.65.2`, reflecting tested compatibility with the current stable release
+
 ## 1.2.0 — 2026-03-10
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "pi-file-watcher",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Watch folders for #pi! comments in source files and send them as prompts to the LLM — aider-style watch mode for pi",
   "keywords": [
     "pi-package",
@@ -21,6 +21,6 @@
     "README.md"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.67.6"
+    "@mariozechner/pi-coding-agent": ">=0.70.6"
   }
 }
